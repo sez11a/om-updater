@@ -311,8 +311,6 @@ class OMUpdater(QApplication):
                     pct = int(match.group(1))
                     self._update_progress(pct, "Updating flatpaks...")
             
-            elif "100%" in line and ("[" in line or "Complete!" in line):
-                self._update_progress(100, "Installation complete!")
 
     def _update_finished(self):
         code = self.process.exitCode()
