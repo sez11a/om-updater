@@ -15,11 +15,66 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import QTimer, QProcess, Qt
 from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QPen, QFont, QAction
 
+try:
+    import libdnf5.base
+    import libdnf5.transaction
+except ImportError:
+    libdnf5 = None
 
 def handle_sigint(signum, frame):
     print("\nReceived Ctrl-C, shutting down...")
     QApplication.quit()
 
+
+class DNFBackend:
+    """Handles the DNF5 Python API update logic."""
+    def __init__(self):
+        if libdnf5 is None:
+            raise ImportError("libdnf5 is not installed on this system")
+        self.base = libdnf5.base.Base()
+        self.base.setup()
+
+    def run_update(self):
+        try:
+            print("STATUS: Initializing...")
+            print("PROGRESS: 5%")
+            
+            print("STATUS: Refreshing repositories and metadata...")
+            print("PROGRESS: 15%")
+            # Ensure repositories are correctly initialized and loaded
+            self.base.get_repo_sack().create_repos_from_system_configuration()
+            self.base.get_repo_sack().load_repos()
+            
+            print("STATUS: Resolving dependencies...")
+            print("PROGRESS: 30%")
+            goal = libdnf5.base.Goal(self.base)
+            goal.add_rpm_distro_sync()
+            goal.set_allow_erasing(True)
+            transaction = goal.resolve()
+            
+            if transaction.empty():
+                print("STATUS: System already up to date.")
+                print("PROGRESS: 100%")
+                return
+
+            print(f"STATUS: Found {transaction.get_transaction_packages_count()} packages to update...")
+            print("STATUS: Downloading packages... (this may take a while on slow connections)")
+            print("PROGRESS: 50%")
+            transaction.download()
+            
+            print("STATUS: Applying updates...")
+            print("PROGRESS: 75%")
+            result = transaction.run()
+            
+            print("STATUS: Finalizing...")
+            print("PROGRESS: 90%")
+            
+            print(f"STATUS: Transaction finished. Result: {result}")
+            print("PROGRESS: 100%")
+            
+        except Exception as e:
+            print(f"ERROR: {str(e)}")
+            sys.exit(1)
 
 class OMUpdater(QApplication):
     def __init__(self):
@@ -45,6 +100,7 @@ class OMUpdater(QApplication):
         self.timer.start(30 * 60 * 1000)
 
         self.check_for_updates()
+
 
     def _create_circle_icon(self, bg_color: QColor, text: str | None):
         size = 64
@@ -208,7 +264,7 @@ class OMUpdater(QApplication):
 
     def _start_update(self, confirm_dialog: QDialog, update_type: str):
         confirm_dialog.accept()
-
+        
         self.output_win = QDialog()
         self.output_win.setWindowTitle(f"Applying {update_type.upper()} Updates")
         self.output_win.resize(1000, 700)
@@ -238,29 +294,32 @@ class OMUpdater(QApplication):
         self.process.readyReadStandardError.connect(self._handle_stderr)
         self.process.finished.connect(self._update_finished)
 
-        script_lines = ['echo "=== Starting update ==="']
         self._update_progress(0, "Initializing...")
 
         if update_type in ("all", "rpm"):
-            script_lines.append('echo "=== RPM Update ==="')
-            script_lines.append('echo "=== Metadata Refresh ==="')
-            script_lines.append('pkexec dnf distro-sync --refresh --allowerasing -y || echo "RPM update had warnings"')
+            self.output_text.appendPlainText("=== Starting RPM Update via API ===\n")
+            # Execute the script itself in worker mode via pkexec
+            # Use os.path.abspath to ensure the full path is passed to pkexec
+            import os
+            script_path = os.path.abspath(sys.argv[0])
+            self.process.setProgram("pkexec")
+            self.process.setArguments(["python3", script_path, "--worker"])
+        elif update_type == "flatpak":
+            # Flatpaks still use shell commands as they have no standard Python API for system updates
+            script = (
+                'echo "=== User Flatpaks Update ==="\n'
+                'flatpak update --user --assumeyes --noninteractive || echo "User Flatpak update had warnings"\n'
+                'echo "\n=== System Flatpaks Update ==="\n'
+                'pkexec flatpak update --system --assumeyes --noninteractive || echo "System Flatpak update had warnings"\n'
+                'echo "\n=== Update process finished ===\n"'
+            )
+            self.process.setProgram("bash")
+            self.process.setArguments(["-c", script])
+        else:
+            # This should not be reached
+            self.process.setProgram("echo")
+            self.process.setArguments(["Unknown update type"])
 
-        if update_type in ("all", "flatpak"):
-            script_lines.append('echo "\n=== User Flatpaks Update ==="')
-            script_lines.append('flatpak update --user --assumeyes --noninteractive || echo "User Flatpak update had warnings"')
-
-            script_lines.append('echo "\n=== System Flatpaks Update ==="')
-            script_lines.append('pkexec flatpak update --system --assumeyes --noninteractive || echo "System Flatpak update had warnings"')
-
-        script_lines.append('echo "\n=== Update process finished ===\n"')
-        script = "\n".join(script_lines)
-
-        self.output_text.appendPlainText("Running update with the following commands:\n")
-        self.output_text.appendPlainText(script + "\n" + "="*60 + "\n")
-
-        self.process.setProgram("bash")
-        self.process.setArguments(["-c", script])
         self.process.start()
 
     def _update_progress(self, value: int, message: str):
@@ -275,8 +334,9 @@ class OMUpdater(QApplication):
 
     def _handle_stdout(self):
         data = self.process.readAllStandardOutput().data().decode("utf-8", errors="replace")
-        self.output_text.appendPlainText(data)
-        self._parse_progress(data)
+        if data:
+            self.output_text.appendPlainText(data)
+            self._parse_progress(data)
 
     def _handle_stderr(self):
         data = self.process.readAllStandardError().data().decode("utf-8", errors="replace")
@@ -284,32 +344,30 @@ class OMUpdater(QApplication):
         self._parse_progress(data)
 
     def _parse_progress(self, text: str):
-        import re
-        
         lines = text.splitlines()
         for line in lines:
             line = line.strip()
+            if not line:
+                continue
+                
+            if line.startswith("STATUS:"):
+                msg = line.replace("STATUS:", "").strip()
+                self._update_progress(self.progress_bar.value(), msg)
             
-            if "Metadata Refresh" in line or "Metadata refresh" in line:
-                self._update_progress(5, "Refreshing metadata...")
-            
-            elif "% " in line and ("Downloading" in line or "Downloading packages" in line):
-                match = re.search(r'(\d+)%', line)
-                if match:
-                    pct = int(match.group(1))
-                    self._update_progress(pct, "Downloading packages...")
-            
-            elif "Installing" in line or "Install" in line:
-                match = re.search(r'(\d+)%', line)
-                if match:
-                    pct = int(match.group(1))
-                    self._update_progress(pct, "Installing packages...")
+            elif line.startswith("PROGRESS:"):
+                try:
+                    pct = int(line.replace("PROGRESS:", "").strip().replace("%", ""))
+                except ValueError:
+                    pass
             
             elif "Updating:" in line or "Update:" in line:
+                import re
                 match = re.search(r'(\d+)%', line)
                 if match:
                     pct = int(match.group(1))
                     self._update_progress(pct, "Updating flatpaks...")
+
+
             
 
     def _update_finished(self):
@@ -326,6 +384,11 @@ class OMUpdater(QApplication):
 
 
 if __name__ == "__main__":
+    if "--worker" in sys.argv:
+        backend = DNFBackend()
+        backend.run_update()
+        sys.exit(0)
+
     app = OMUpdater()
 
     timer = QTimer()

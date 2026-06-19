@@ -20,7 +20,7 @@ python om-updater.py
 
 ## Update Command
 
-Uses `pkexec dnf distro-sync --refresh --allowerasing` (not `dnf update`)
+Performs a `distro-sync` using the `libdnf5` Python API via a privileged worker mode (executed via `pkexec`).
 
 ## Environment
 
