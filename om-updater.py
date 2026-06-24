@@ -31,6 +31,9 @@ class DNFBackend:
     def __init__(self):
         if libdnf5 is None:
             raise ImportError("libdnf5 is not installed on this system")
+        print("STATUS: Clearing DNF cache...")
+        subprocess.run(["dnf", "clean", "all"], capture_output=True, timeout=60)
+        print("STATUS: Creating DNF base...")
         self.base = libdnf5.base.Base()
         self.base.setup()
 
@@ -41,9 +44,10 @@ class DNFBackend:
             
             print("STATUS: Refreshing repositories and metadata...")
             print("PROGRESS: 15%")
-            # Ensure repositories are correctly initialized and loaded
-            self.base.get_repo_sack().create_repos_from_system_configuration()
-            self.base.get_repo_sack().load_repos()
+            rs = self.base.get_repo_sack()
+            rs.create_repos_from_system_configuration()
+            rs.load_repos()
+            print(f"STATUS: Loaded {rs.size()} repositories")
             
             print("STATUS: Resolving dependencies...")
             print("PROGRESS: 30%")
@@ -51,6 +55,9 @@ class DNFBackend:
             goal.add_rpm_distro_sync()
             goal.set_allow_erasing(True)
             transaction = goal.resolve()
+            print(f"STATUS: Transaction packages count: {transaction.get_transaction_packages_count()}")
+            
+
             
             if transaction.empty():
                 print("STATUS: System already up to date.")
@@ -84,6 +91,7 @@ class OMUpdater(QApplication):
         self.rpm_updates = []
         self.flatpak_updates = []   # combined with [User] / [System] prefix
         self.updates_available = False
+        self.update_in_progress = False
 
         self.green_icon = self._create_circle_icon(QColor(0, 180, 0), None)
         self.red_icon = self._create_circle_icon(QColor(220, 20, 20), "!")
@@ -97,7 +105,7 @@ class OMUpdater(QApplication):
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.check_for_updates)
-        self.timer.start(30 * 60 * 1000)
+        self.timer.start(60 * 60 * 1000)
 
         self.check_for_updates()
 
@@ -132,7 +140,8 @@ class OMUpdater(QApplication):
         self.tray.setContextMenu(menu)
 
     def check_for_updates(self):
-        print("Checking for updates...")
+        if self.update_in_progress:
+            return
         self.rpm_updates = self._check_rpm_updates()
         self.flatpak_updates = self._check_flatpak_updates()
 
@@ -263,7 +272,9 @@ class OMUpdater(QApplication):
         dlg.exec()
 
     def _start_update(self, confirm_dialog: QDialog, update_type: str):
+        print(f"_start_update called with type: {update_type}")
         confirm_dialog.accept()
+        self.update_in_progress = True
         
         self.output_win = QDialog()
         self.output_win.setWindowTitle(f"Applying {update_type.upper()} Updates")
@@ -292,20 +303,25 @@ class OMUpdater(QApplication):
         self.process = QProcess(self)
         self.process.readyReadStandardOutput.connect(self._handle_stdout)
         self.process.readyReadStandardError.connect(self._handle_stderr)
-        self.process.finished.connect(self._update_finished)
 
         self._update_progress(0, "Initializing...")
 
-        if update_type in ("all", "rpm"):
+        if update_type == "all":
             self.output_text.appendPlainText("=== Starting RPM Update via API ===\n")
-            # Execute the script itself in worker mode via pkexec
-            # Use os.path.abspath to ensure the full path is passed to pkexec
             import os
             script_path = os.path.abspath(sys.argv[0])
             self.process.setProgram("pkexec")
             self.process.setArguments(["python3", script_path, "--worker"])
+            self.process.finished.connect(self._on_rpm_update_finished)
+        elif update_type == "rpm":
+            self.output_text.appendPlainText("=== Starting RPM Update via API ===\n")
+            import os
+            script_path = os.path.abspath(sys.argv[0])
+            self.process.setProgram("pkexec")
+            self.process.setArguments(["python3", script_path, "--worker"])
+            self.process.finished.connect(self._update_finished)
         elif update_type == "flatpak":
-            # Flatpaks still use shell commands as they have no standard Python API for system updates
+            self.process.finished.connect(self._update_finished)
             script = (
                 'echo "=== User Flatpaks Update ==="\n'
                 'flatpak update --user --assumeyes --noninteractive || echo "User Flatpak update had warnings"\n'
@@ -370,17 +386,37 @@ class OMUpdater(QApplication):
 
             
 
+    def _on_rpm_update_finished(self):
+        print("_on_rpm_update_finished called")
+        self.output_text.appendPlainText("\n✅ RPM update completed!")
+        self.output_text.appendPlainText("\n=== Starting Flatpak Update ===\n")
+        self.process.finished.disconnect()
+        self.process.finished.connect(self._update_finished)
+        script = (
+            'echo "=== User Flatpaks Update ==="\n'
+            'flatpak update --user --assumeyes --noninteractive || echo "User Flatpak update had warnings"\n'
+            'echo "\n=== System Flatpaks Update ==="\n'
+            'pkexec flatpak update --system --assumeyes --noninteractive || echo "System Flatpak update had warnings"\n'
+            'echo "\n=== Update process finished ===\n"'
+        )
+        self.process.setProgram("bash")
+        self.process.setArguments(["-c", script])
+        print("Starting Flatpak process...")
+        self.process.start()
+
     def _update_finished(self):
+        print("_update_finished called")
         code = self.process.exitCode()
         if code == 0:
             self.output_text.appendPlainText("\n✅ Update process completed!")
-            self._update_progress(100, "✅ It is now safe to close this window")
+            self._update_progress(100, "✅ Update completed")
         else:
             self.output_text.appendPlainText(f"\n⚠️ Process finished with exit code {code}")
             self._update_progress(0, "⚠️ Update completed with warnings")
 
-        self.output_text.appendPlainText("\nRe-checking for remaining updates in a few seconds...")
-        QTimer.singleShot(3000, self.check_for_updates)   # 3-second delay
+        self.update_in_progress = False
+        self.output_text.appendPlainText("\nUpdate process finished. You may close this window.")
+        self.check_for_updates()
 
 
 if __name__ == "__main__":
