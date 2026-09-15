@@ -7,6 +7,8 @@ Fixed Flatpak update logic: uses --assumeyes --noninteractive + separate user/sy
 import sys
 import signal
 import subprocess
+import os
+import re
 from PyQt6.QtWidgets import (
     QApplication, QSystemTrayIcon, QMenu, QDialog,
     QVBoxLayout, QHBoxLayout, QLabel, QListWidget,
@@ -17,13 +19,58 @@ from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QPen, QFont, QAction
 
 try:
     import libdnf5.base
-    import libdnf5.transaction
+    import libdnf5.rpm
 except ImportError:
     libdnf5 = None
+    libdnf5.rpm = None
 
 def handle_sigint(signum, frame):
     print("\nReceived Ctrl-C, shutting down...")
     QApplication.quit()
+
+
+class _ProgressCallbacks(libdnf5.rpm.TransactionCallbacks):
+    def __init__(self, total_packages):
+        super().__init__()
+        self.total = total_packages
+        self.current_pkg = 0
+
+    def _pkg_name(self, pkg):
+        try:
+            if hasattr(pkg, 'get_package'):
+                rpm_pkg = pkg.get_package()
+                if rpm_pkg and hasattr(rpm_pkg, 'get_name'):
+                    return rpm_pkg.get_name()
+            return str(pkg)[:60]
+        except:
+            return str(pkg)[:60]
+
+    def elem_progress(self, pkg, amount, total):
+        self.current_pkg = amount
+        pkg_str = self._pkg_name(pkg)
+        print(f"PACKAGE: {amount}/{total} - {pkg_str}", flush=True)
+        return True
+
+    def install_progress(self, pkg, amount, total):
+        print(f"PROGRESS: Installing... {amount}%", flush=True)
+        return True
+
+    def install_start(self, pkg):
+        pkg_str = self._pkg_name(pkg)
+        print(f"INSTALLING: {pkg_str}", flush=True)
+        return True
+
+    def install_stop(self, pkg):
+        pkg_str = self._pkg_name(pkg)
+        print(f"INSTALLED: {pkg_str}", flush=True)
+        return True
+
+    def after_complete(self, success):
+        if success:
+            print("STATUS: Transaction completed successfully", flush=True)
+        else:
+            print("STATUS: Transaction completed with issues", flush=True)
+        return True
 
 
 class DNFBackend:
@@ -31,57 +78,89 @@ class DNFBackend:
     def __init__(self):
         if libdnf5 is None:
             raise ImportError("libdnf5 is not installed on this system")
-        print("STATUS: Clearing DNF cache...")
+        print("STATUS: Clearing DNF cache...", flush=True)
         subprocess.run(["dnf", "clean", "all"], capture_output=True, timeout=60)
-        print("STATUS: Creating DNF base...")
+        print("STATUS: Creating DNF base...", flush=True)
         self.base = libdnf5.base.Base()
         self.base.setup()
 
     def run_update(self):
         try:
-            print("STATUS: Initializing...")
-            print("PROGRESS: 5%")
+            print("STATUS: Initializing...", flush=True)
+            print("PROGRESS: 5%", flush=True)
             
-            print("STATUS: Refreshing repositories and metadata...")
-            print("PROGRESS: 15%")
+            print("STATUS: Refreshing repositories and metadata...", flush=True)
+            print("PROGRESS: 15%", flush=True)
             rs = self.base.get_repo_sack()
             rs.create_repos_from_system_configuration()
             rs.load_repos()
-            print(f"STATUS: Loaded {rs.size()} repositories")
+            print(f"STATUS: Loaded {rs.size()} repositories", flush=True)
             
-            print("STATUS: Resolving dependencies...")
-            print("PROGRESS: 30%")
+            print("STATUS: Resolving dependencies...", flush=True)
+            print("PROGRESS: 30%", flush=True)
             goal = libdnf5.base.Goal(self.base)
             goal.add_rpm_distro_sync()
             goal.set_allow_erasing(True)
             transaction = goal.resolve()
-            print(f"STATUS: Transaction packages count: {transaction.get_transaction_packages_count()}")
-            
-
+            pkg_count = transaction.get_transaction_packages_count()
+            print(f"STATUS: {pkg_count} packages to update", flush=True)
             
             if transaction.empty():
-                print("STATUS: System already up to date.")
-                print("PROGRESS: 100%")
+                print("STATUS: System already up to date.", flush=True)
+                print("PROGRESS: 100%", flush=True)
                 return
 
-            print(f"STATUS: Found {transaction.get_transaction_packages_count()} packages to update...")
-            print("STATUS: Downloading packages... (this may take a while on slow connections)")
-            print("PROGRESS: 50%")
+            print("STATUS: Downloading packages... (this may take a while on slow connections)", flush=True)
+            
+            try:
+                pkgs = transaction.get_transaction_packages()
+                shown = 0
+                for pkg in pkgs:
+                    try:
+                        if hasattr(pkg, 'get_package'):
+                            rpm_pkg = pkg.get_package()
+                            if rpm_pkg and hasattr(rpm_pkg, 'get_name'):
+                                pkg_name = rpm_pkg.get_name()
+                            else:
+                                pkg_name = str(pkg)
+                        else:
+                            pkg_name = str(pkg)
+                    except Exception:
+                        pkg_name = str(pkg)
+                    
+                    print(f"PACKAGE: {pkg_name}", flush=True)
+                    shown += 1
+                    if shown >= 5:
+                        remaining = pkgs.size() - shown
+                        if remaining > 0:
+                            print(f"... and {remaining} more packages will be downloaded", flush=True)
+                        break
+            except Exception as e:
+                print(f"WARNING: Could not list packages: {e}", flush=True)
+            
+            print("STATUS: Starting download...", flush=True)
+            print("PROGRESS: 50%", flush=True)
             transaction.download()
             
-            print("STATUS: Applying updates...")
-            print("PROGRESS: 75%")
+            print("STATUS: Applying updates...", flush=True)
+            print("PROGRESS: 75%", flush=True)
+            
+            if libdnf5.rpm:
+                callbacks = _ProgressCallbacks(pkg_count)
+                cb_ptr = libdnf5.rpm.TransactionCallbacksUniquePtr(callbacks)
+                transaction.set_callbacks(cb_ptr)
+            
             result = transaction.run()
             
-            print("STATUS: Finalizing...")
-            print("PROGRESS: 90%")
+            print("STATUS: Finalizing...", flush=True)
+            print("PROGRESS: 90%", flush=True)
             
-            print(f"STATUS: Transaction finished. Result: {result}")
-            print("PROGRESS: 100%")
+            print(f"STATUS: Transaction finished. Result: {result}", flush=True)
+            print("PROGRESS: 100%", flush=True)
             
         except Exception as e:
-            print(f"ERROR: {str(e)}")
-            sys.exit(1)
+            print(f"ERROR: {str(e)}", flush=True)
+            os._exit(1)
 
 class OMUpdater(QApplication):
     def __init__(self):
@@ -301,26 +380,29 @@ class OMUpdater(QApplication):
         self.output_win.show()
 
         self.process = QProcess(self)
+        self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         self.process.readyReadStandardOutput.connect(self._handle_stdout)
         self.process.readyReadStandardError.connect(self._handle_stderr)
 
         self._update_progress(0, "Initializing...")
 
         if update_type == "all":
-            self.output_text.appendPlainText("=== Starting RPM Update via API ===\n")
-            import os
+            self.progress_bar.setRange(0, 0)
+            self.status_label.setText("Updating RPM packages...")
             script_path = os.path.abspath(sys.argv[0])
             self.process.setProgram("pkexec")
-            self.process.setArguments(["python3", script_path, "--worker"])
+            self.process.setArguments(["python3", "-u", script_path, "--worker"])
             self.process.finished.connect(self._on_rpm_update_finished)
         elif update_type == "rpm":
-            self.output_text.appendPlainText("=== Starting RPM Update via API ===\n")
-            import os
+            self.progress_bar.setRange(0, 0)
+            self.status_label.setText("Updating RPM packages...")
             script_path = os.path.abspath(sys.argv[0])
             self.process.setProgram("pkexec")
-            self.process.setArguments(["python3", script_path, "--worker"])
+            self.process.setArguments(["python3", "-u", script_path, "--worker"])
             self.process.finished.connect(self._update_finished)
         elif update_type == "flatpak":
+            self.progress_bar.setRange(0, 0)
+            self.status_label.setText("Updating Flatpak packages...")
             self.process.finished.connect(self._update_finished)
             script = (
                 'echo "=== User Flatpaks Update ==="\n'
@@ -377,19 +459,29 @@ class OMUpdater(QApplication):
                     pass
             
             elif "Updating:" in line or "Update:" in line:
-                import re
                 match = re.search(r'(\d+)%', line)
                 if match:
                     pct = int(match.group(1))
-                    self._update_progress(pct, "Updating flatpaks...")
-
-
+                    self._update_progress(pct, "Updating flatpaks:")
             
+            elif line.startswith("PACKAGE:"):
+                pkg_info = line.replace("PACKAGE:", "").strip()
+                self.status_label.setText(f"Processing package: {pkg_info[:50]}...")
+            
+            elif line.startswith("INSTALLING:"):
+                pkg_info = line.replace("INSTALLING:", "").strip()
+                self.status_label.setText(f"Installing: {pkg_info[:50]}")
+            
+            elif line.startswith("INSTALLED:"):
+                pkg_info = line.replace("INSTALLED:", "").strip()
+                self.status_label.setText(f"Installed: {pkg_info[:50]}")
 
     def _on_rpm_update_finished(self):
         print("_on_rpm_update_finished called")
         self.output_text.appendPlainText("\n✅ RPM update completed!")
         self.output_text.appendPlainText("\n=== Starting Flatpak Update ===\n")
+        self.progress_bar.setRange(0, 0)
+        self.status_label.setText("Updating Flatpak packages...")
         self.process.finished.disconnect()
         self.process.finished.connect(self._update_finished)
         script = (
@@ -407,6 +499,7 @@ class OMUpdater(QApplication):
     def _update_finished(self):
         print("_update_finished called")
         code = self.process.exitCode()
+        self.progress_bar.setRange(0, 100)
         if code == 0:
             self.output_text.appendPlainText("\n✅ Update process completed!")
             self._update_progress(100, "✅ Update completed")
@@ -421,6 +514,7 @@ class OMUpdater(QApplication):
 
 if __name__ == "__main__":
     if "--worker" in sys.argv:
+        sys.stdout.reconfigure(line_buffering=True)
         backend = DNFBackend()
         backend.run_update()
         sys.exit(0)

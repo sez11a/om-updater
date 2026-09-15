@@ -38,9 +38,10 @@ python om-updater.py
 
 - Create a fresh `Base()` instance for each worker run
 - Call `base.setup()` then `repo_sack.load_repos()` to initialize repositories
-- Use `add_rpm_distro_sync()` with `set_allow_erasing(True)` for OpenMandriva
+- Use `add_rpm_distro_sync()` with `set_allow_erasing(True)` for OpenMandriva (NOT `add_rpm_upgrade()`)
 - Always call `transaction.run()` after `goal.resolve()` to actually apply changes
 - Do not try to modify config after `setup()` - options are locked
+- DNF cache must be cleared at worker startup with `dnf clean all` to avoid stale metadata
 
 ## Signal Handling
 
@@ -52,3 +53,19 @@ python om-updater.py
 - Worker must run as root via `pkexec` for system-wide updates
 - DNF cache must be cleared at worker startup to avoid stale metadata
 - Flatpak system updates require `pkexec` and password prompt
+
+## Packaging
+
+To build an RPM package for OpenMandriva:
+
+1. Update `Makefile` and `om-updater.spec` as needed
+2. Run `make tarball` to create `om-updater-1.0.0.tar.gz` with correct directory structure
+3. Copy tarball to `/home/sezovr/abf/om-updater/` and update `.abf.yml` with the SHA512 hash
+4. Build with `abb build`
+
+**Package requirements** (OpenMandriva naming):
+- `python-qt6-core`, `python-qt6-widgets` (not `python3-pyqt6`)
+- `python-libdnf5` is provided by `python-dnf` >= 5.0 (DNF 5)
+- `dnf5`, `flatpak`
+
+**Important**: OpenMandriva uses different package names than other distros. Always verify package names with `dnf search` or `rpm -qa`.
