@@ -69,3 +69,36 @@ To build an RPM package for OpenMandriva:
 - `dnf5`, `flatpak`
 
 **Important**: OpenMandriva uses different package names than other distros. Always verify package names with `dnf search` or `rpm -qa`.
+
+## @om-installer.py - Graphical Package Installer
+
+### Quick Start
+
+```bash
+python3 om-installer.py
+```
+
+### Architecture
+
+- Two-pane interface: category list (left) and package list (right)
+- Entry point: `main()` function which creates `QApplication` then `OMInstaller` window
+- Uses `QTreeWidget` for package display with resizable columns (Name, Version, Description, Repository)
+- Supports RPM (via `dnf` commands), Flatpak, and Snap backends
+
+### Backends
+
+- **RPMBackend**: Uses `dnf search`, `dnf install`, `dnf remove`, `dnf info` commands
+- **FlatpakBackend**: Uses `flatpak search`, `flatpak install`, `flatpak remove`, `flatpak info` commands
+- **SnapBackend**: Uses `snap find`, `snap install`, `snap remove`, `snap info` commands
+
+### Worker Mode
+
+- Run with `--worker JOB_FILE` flag for privileged package operations
+- Spawned via `pkexec` from the main GUI for install/remove operations
+- Job file is JSON with `action`, `source`, and `packages` fields
+
+### Important Notes
+
+- **QApplication must be created BEFORE any QWidget** - this was the original bug causing "QWidget: Must construct a QApplication before a QWidget"
+- Signal blocking is used during UI initialization to prevent crashes from early signal emission
+- Installed packages displayed in green text for visual distinction
