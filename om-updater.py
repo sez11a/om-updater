@@ -17,150 +17,39 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import QTimer, QProcess, Qt
 from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QPen, QFont, QAction
 
-try:
-    import libdnf5.base
-    import libdnf5.rpm
-except ImportError:
-    libdnf5 = None
-    libdnf5.rpm = None
 
 def handle_sigint(signum, frame):
     print("\nReceived Ctrl-C, shutting down...")
     QApplication.quit()
 
 
-class _ProgressCallbacks(libdnf5.rpm.TransactionCallbacks):
-    def __init__(self, total_packages):
-        super().__init__()
-        self.total = total_packages
-        self.current_pkg = 0
-
-    def _pkg_name(self, pkg):
-        try:
-            if hasattr(pkg, 'get_package'):
-                rpm_pkg = pkg.get_package()
-                if rpm_pkg and hasattr(rpm_pkg, 'get_name'):
-                    return rpm_pkg.get_name()
-            return str(pkg)[:60]
-        except:
-            return str(pkg)[:60]
-
-    def elem_progress(self, pkg, amount, total):
-        self.current_pkg = amount
-        pkg_str = self._pkg_name(pkg)
-        print(f"PACKAGE: {amount}/{total} - {pkg_str}", flush=True)
-        return True
-
-    def install_progress(self, pkg, amount, total):
-        print(f"PROGRESS: Installing... {amount}%", flush=True)
-        return True
-
-    def install_start(self, pkg):
-        pkg_str = self._pkg_name(pkg)
-        print(f"INSTALLING: {pkg_str}", flush=True)
-        return True
-
-    def install_stop(self, pkg):
-        pkg_str = self._pkg_name(pkg)
-        print(f"INSTALLED: {pkg_str}", flush=True)
-        return True
-
-    def after_complete(self, success):
-        if success:
-            print("STATUS: Transaction completed successfully", flush=True)
-        else:
-            print("STATUS: Transaction completed with issues", flush=True)
-        return True
-
-
 class DNFBackend:
-    """Handles the DNF5 Python API update logic."""
     def __init__(self):
-        if libdnf5 is None:
-            raise ImportError("libdnf5 is not installed on this system")
-        print("STATUS: Clearing DNF cache...", flush=True)
-        subprocess.run(["dnf", "clean", "all"], capture_output=True, timeout=60)
-        print("STATUS: Creating DNF base...", flush=True)
-        self.base = libdnf5.base.Base()
-        self.base.setup()
-
+        pass
+    
     def run_update(self):
+        print("STATUS: Updating system packages...", flush=True)
         try:
-            print("STATUS: Initializing...", flush=True)
-            print("PROGRESS: 5%", flush=True)
-            
-            print("STATUS: Refreshing repositories and metadata...", flush=True)
-            print("PROGRESS: 15%", flush=True)
-            rs = self.base.get_repo_sack()
-            rs.create_repos_from_system_configuration()
-            rs.load_repos()
-            print(f"STATUS: Loaded {rs.size()} repositories", flush=True)
-            
-            print("STATUS: Resolving dependencies...", flush=True)
-            print("PROGRESS: 30%", flush=True)
-            goal = libdnf5.base.Goal(self.base)
-            goal.add_rpm_distro_sync()
-            goal.set_allow_erasing(True)
-            transaction = goal.resolve()
-            pkg_count = transaction.get_transaction_packages_count()
-            print(f"STATUS: {pkg_count} packages to update", flush=True)
-            
-            if transaction.empty():
-                print("STATUS: System already up to date.", flush=True)
-                print("PROGRESS: 100%", flush=True)
-                return
-
-            print("STATUS: Downloading packages... (this may take a while on slow connections)", flush=True)
-            
-            try:
-                pkgs = transaction.get_transaction_packages()
-                shown = 0
-                for pkg in pkgs:
-                    try:
-                        if hasattr(pkg, 'get_package'):
-                            rpm_pkg = pkg.get_package()
-                            if rpm_pkg and hasattr(rpm_pkg, 'get_name'):
-                                pkg_name = rpm_pkg.get_name()
-                            else:
-                                pkg_name = str(pkg)
-                        else:
-                            pkg_name = str(pkg)
-                    except Exception:
-                        pkg_name = str(pkg)
-                    
-                    print(f"PACKAGE: {pkg_name}", flush=True)
-                    shown += 1
-                    if shown >= 5:
-                        remaining = pkgs.size() - shown
-                        if remaining > 0:
-                            print(f"... and {remaining} more packages will be downloaded", flush=True)
-                        break
-            except Exception as e:
-                print(f"WARNING: Could not list packages: {e}", flush=True)
-            
-            print("STATUS: Starting download...", flush=True)
-            print("PROGRESS: 50%", flush=True)
-            transaction.download()
-            
-            print("STATUS: Applying updates...", flush=True)
-            print("PROGRESS: 75%", flush=True)
-            
-            if libdnf5.rpm:
-                callbacks = _ProgressCallbacks(pkg_count)
-                cb_ptr = libdnf5.rpm.TransactionCallbacksUniquePtr(callbacks)
-                transaction.set_callbacks(cb_ptr)
-            
-            result = transaction.run()
-            
-            print("STATUS: Finalizing...", flush=True)
-            print("PROGRESS: 90%", flush=True)
-            
-            print(f"STATUS: Transaction finished. Result: {result}", flush=True)
-            print("PROGRESS: 100%", flush=True)
-            
+            result = subprocess.run(
+                ["dnf", "dsync", "--allowerasing", "-y"],
+                capture_output=True, text=True, timeout=600
+            )
+            if result.stdout:
+                for line in result.stdout.splitlines()[-50:]:
+                    print(line, flush=True)
+            if result.returncode == 0:
+                print("STATUS: Update completed successfully", flush=True)
+            else:
+                print(f"STATUS: Update finished with code {result.returncode}", flush=True)
+                if result.stderr:
+                    print(result.stderr, flush=True)
+            return result.returncode
+        except subprocess.TimeoutExpired:
+            print("ERROR: DNF update timed out", flush=True)
+            return 1
         except Exception as e:
             print(f"ERROR: {str(e)}", flush=True)
-            os._exit(1)
+            return 1
 
 class OMUpdater(QApplication):
     def __init__(self):
@@ -386,30 +275,35 @@ class OMUpdater(QApplication):
 
         self._update_progress(0, "Initializing...")
 
+        display = os.environ.get("DISPLAY", "")
+        wayland_display = os.environ.get("WAYLAND_DISPLAY", "")
+
         if update_type == "all":
             self.progress_bar.setRange(0, 0)
             self.status_label.setText("Updating RPM packages...")
             script_path = os.path.abspath(sys.argv[0])
-            self.process.setProgram("pkexec")
-            self.process.setArguments(["python3", "-u", script_path, "--worker"])
+            script = f'export DISPLAY="{display}" WAYLAND_DISPLAY="{wayland_display}"; pkexec python3 -u "{script_path}" --worker'
+            self.process.setProgram("bash")
+            self.process.setArguments(["-c", script])
             self.process.finished.connect(self._on_rpm_update_finished)
         elif update_type == "rpm":
             self.progress_bar.setRange(0, 0)
             self.status_label.setText("Updating RPM packages...")
             script_path = os.path.abspath(sys.argv[0])
-            self.process.setProgram("pkexec")
-            self.process.setArguments(["python3", "-u", script_path, "--worker"])
+            script = f'export DISPLAY="{display}" WAYLAND_DISPLAY="{wayland_display}"; pkexec python3 -u "{script_path}" --worker'
+            self.process.setProgram("bash")
+            self.process.setArguments(["-c", script])
             self.process.finished.connect(self._update_finished)
         elif update_type == "flatpak":
             self.progress_bar.setRange(0, 0)
             self.status_label.setText("Updating Flatpak packages...")
             self.process.finished.connect(self._update_finished)
             script = (
-                'echo "=== User Flatpaks Update ==="\n'
-                'flatpak update --user --assumeyes --noninteractive || echo "User Flatpak update had warnings"\n'
-                'echo "\n=== System Flatpaks Update ==="\n'
-                'pkexec flatpak update --system --assumeyes --noninteractive || echo "System Flatpak update had warnings"\n'
-                'echo "\n=== Update process finished ===\n"'
+                f'echo "=== User Flatpaks Update ==="\n'
+                f'flatpak update --user --assumeyes --noninteractive || echo "User Flatpak update had warnings"\n'
+                f'echo "\n=== System Flatpaks Update ==="\n'
+                f'export DISPLAY="{display}" WAYLAND_DISPLAY="{wayland_display}"; pkexec flatpak update --system --assumeyes --noninteractive || echo "System Flatpak update had warnings"\n'
+                f'echo "\n=== Update process finished ===\n"'
             )
             self.process.setProgram("bash")
             self.process.setArguments(["-c", script])
@@ -484,12 +378,14 @@ class OMUpdater(QApplication):
         self.status_label.setText("Updating Flatpak packages...")
         self.process.finished.disconnect()
         self.process.finished.connect(self._update_finished)
+        display = os.environ.get("DISPLAY", "")
+        wayland_display = os.environ.get("WAYLAND_DISPLAY", "")
         script = (
-            'echo "=== User Flatpaks Update ==="\n'
-            'flatpak update --user --assumeyes --noninteractive || echo "User Flatpak update had warnings"\n'
-            'echo "\n=== System Flatpaks Update ==="\n'
-            'pkexec flatpak update --system --assumeyes --noninteractive || echo "System Flatpak update had warnings"\n'
-            'echo "\n=== Update process finished ===\n"'
+            f'echo "=== User Flatpaks Update ==="\n'
+            f'flatpak update --user --assumeyes --noninteractive || echo "User Flatpak update had warnings"\n'
+            f'echo "\n=== System Flatpaks Update ==="\n'
+            f'export DISPLAY="{display}" WAYLAND_DISPLAY="{wayland_display}"; pkexec flatpak update --system --assumeyes --noninteractive || echo "System Flatpak update had warnings"\n'
+            f'echo "\n=== Update process finished ===\n"'
         )
         self.process.setProgram("bash")
         self.process.setArguments(["-c", script])
@@ -516,8 +412,8 @@ if __name__ == "__main__":
     if "--worker" in sys.argv:
         sys.stdout.reconfigure(line_buffering=True)
         backend = DNFBackend()
-        backend.run_update()
-        sys.exit(0)
+        exit_code = backend.run_update()
+        sys.exit(exit_code if exit_code else 0)
 
     app = OMUpdater()
 

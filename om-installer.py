@@ -672,7 +672,7 @@ class OMInstaller(QMainWindow):
             self._spawn_worker(packages, "remove")
     
     def _spawn_worker(self, packages: list[Package], action: str):
-        worker_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "om-installer.py")
+        worker_script = os.path.abspath(__file__)
         
         job_file = f"/tmp/om-installer-job-{os.getpid()}.json"
         with open(job_file, 'w') as f:
@@ -680,7 +680,7 @@ class OMInstaller(QMainWindow):
         
         self.install_process = QProcess(self)
         self.install_process.setProgram("pkexec")
-        self.install_process.setArguments(["python3", worker_script, "--worker", job_file])
+        self.install_process.setArguments(["python3", "-u", worker_script, "--worker", job_file])
         self.install_process.finished.connect(self._on_install_finished)
         self.install_process.start()
     
