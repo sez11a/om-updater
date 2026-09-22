@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 OpenMandriva Graphical Package Installer
-Follows Synaptic/Octopi design principles with two-pane interface
+Follows Synaptic/Octopi design principles with three-pane interface
+(left: categories, middle: package list, bottom: command output)
 """
 
 import sys
@@ -18,10 +19,10 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget,
     QLineEdit, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QMenu, QMessageBox, QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem,
-    QHeaderView
+    QHeaderView, QTextEdit
 )
 from PyQt6.QtCore import QProcess, Qt, QSize, QTimer
-from PyQt6.QtGui import QIcon, QPainter, QColor, QPixmap
+from PyQt6.QtGui import QIcon, QPainter, QColor, QPixmap, QTextCursor
 
 try:
     import libdnf5.base
@@ -164,7 +165,7 @@ class RPMBackend(BaseBackend):
         try:
             result = subprocess.run(
                 ["dnf", "install", "-y", package_name],
-                capture_output=True, text=True, timeout=300
+                timeout=300
             )
             return result.returncode == 0
         except Exception as e:
@@ -175,7 +176,7 @@ class RPMBackend(BaseBackend):
         try:
             result = subprocess.run(
                 ["dnf", "remove", "-y", package_name],
-                capture_output=True, text=True, timeout=60
+                timeout=60
             )
             return result.returncode == 0
         except Exception as e:
@@ -265,7 +266,7 @@ class FlatpakBackend(BaseBackend):
             scope = "--user" if user else "--system"
             result = subprocess.run(
                 ["flatpak", "install", scope, "-y", package_name],
-                capture_output=True, text=True, timeout=300
+                timeout=300
             )
             return result.returncode == 0
         except Exception as e:
@@ -277,7 +278,7 @@ class FlatpakBackend(BaseBackend):
             scope = "--user" if user else "--system"
             result = subprocess.run(
                 ["flatpak", "remove", scope, "-y", package_name],
-                capture_output=True, text=True, timeout=60
+                timeout=60
             )
             return result.returncode == 0
         except Exception as e:
@@ -365,7 +366,7 @@ class SnapBackend(BaseBackend):
         try:
             result = subprocess.run(
                 ["snap", "install", package_name],
-                capture_output=True, text=True, timeout=300
+                timeout=300
             )
             return result.returncode == 0
         except Exception as e:
@@ -376,7 +377,7 @@ class SnapBackend(BaseBackend):
         try:
             result = subprocess.run(
                 ["snap", "remove", package_name],
-                capture_output=True, text=True, timeout=60
+                timeout=60
             )
             return result.returncode == 0
         except Exception as e:
@@ -417,6 +418,8 @@ class OMInstaller(QMainWindow):
         self.packages: dict[str, list[Package]] = {}
         self.search_text = ""
         self.current_category = "RPM"
+        self.is_installing = False
+        self.worker_output: Optional[QTextEdit] = None
         
         self._setup_backends()
         self._setup_ui()
@@ -477,9 +480,19 @@ class OMInstaller(QMainWindow):
         self.package_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.package_list.customContextMenuRequested.connect(self._on_package_context_menu)
         
+        self.worker_output = QTextEdit()
+        self.worker_output.setReadOnly(True)
+        self.worker_output.setPlaceholderText("Command output will appear here...")
+        self.worker_output.hide()
+        
+        self.worker_output_label = QLabel("Installation Output")
+        self.worker_output_label.hide()
+        
         right_layout.addLayout(search_layout)
         right_layout.addWidget(QLabel(f"Category: {self.current_category}"))
         right_layout.addWidget(self.package_list)
+        right_layout.addWidget(self.worker_output_label)
+        right_layout.addWidget(self.worker_output)
         
         main_layout.addWidget(self.category_list)
         main_layout.addLayout(right_layout)
@@ -536,6 +549,13 @@ class OMInstaller(QMainWindow):
                 item.setForeground(2, QColor(0, 180, 0))
             
             self.package_list.addTopLevelItem(item)
+    
+    def _append_to_output(self, text: str):
+        if self.worker_output:
+            self.worker_output.moveCursor(QTextCursor.MoveOperation.End)
+            self.worker_output.insertPlainText(text)
+            self.worker_output.moveCursor(QTextCursor.MoveOperation.End)
+            self.worker_output.verticalScrollBar().setValue(self.worker_output.verticalScrollBar().maximum())
     
     def _on_category_changed(self):
         item = self.category_list.currentItem()
@@ -678,11 +698,30 @@ class OMInstaller(QMainWindow):
         with open(job_file, 'w') as f:
             json.dump({"action": action, "source": self.current_category, "packages": [p.name for p in packages]}, f)
         
+        self.worker_output.clear()
+        self.worker_output_label.show()
+        self.worker_output.show()
+        self.is_installing = True
+        
         self.install_process = QProcess(self)
         self.install_process.setProgram("pkexec")
         self.install_process.setArguments(["python3", "-u", worker_script, "--worker", job_file])
         self.install_process.finished.connect(self._on_install_finished)
+        self.install_process.readyReadStandardOutput.connect(self._on_worker_output)
+        self.install_process.readyReadStandardError.connect(self._on_worker_error)
         self.install_process.start()
+    
+    def _on_worker_output(self):
+        if self.install_process:
+            output = self.install_process.readAllStandardOutput()
+            text = bytes(output).decode('utf-8', errors='replace')
+            self._append_to_output(text)
+    
+    def _on_worker_error(self):
+        if self.install_process:
+            output = self.install_process.readAllStandardError()
+            text = bytes(output).decode('utf-8', errors='replace')
+            self._append_to_output(text)
     
     def _on_install_finished(self, exit_code: int):
         job_file = f"/tmp/om-installer-job-{os.getpid()}.json"
@@ -690,6 +729,8 @@ class OMInstaller(QMainWindow):
             os.unlink(job_file)
         except:
             pass
+        
+        self.is_installing = False
         
         if exit_code == 0:
             QMessageBox.information(self, "Success", "Operation completed successfully!")
