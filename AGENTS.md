@@ -80,9 +80,10 @@ python3 om-installer.py
 
 ### Architecture
 
-- Two-pane interface: category list (left) and package list (right)
+- Three-pane interface: category list (left), package list (right-middle), command output (right-bottom)
 - Entry point: `main()` function which creates `QApplication` then `OMInstaller` window
 - Uses `QTreeWidget` for package display with resizable columns (Name, Version, Description, Repository)
+- Uses `QTextEdit` for streaming CLI output display during package operations
 - Supports RPM (via `dnf` commands), Flatpak, and Snap backends
 
 ### Backends
@@ -90,12 +91,22 @@ python3 om-installer.py
 - **RPMBackend**: Uses `dnf search`, `dnf install`, `dnf remove`, `dnf info` commands
 - **FlatpakBackend**: Uses `flatpak search`, `flatpak install`, `flatpak remove`, `flatpak info` commands
 - **SnapBackend**: Uses `snap find`, `snap install`, `snap remove`, `snap info` commands
+- **Important**: Backend install/remove methods do not use `capture_output=True` to allow CLI output streaming to the output panel
 
 ### Worker Mode
 
 - Run with `--worker JOB_FILE` flag for privileged package operations
 - Spawned via `pkexec` from the main GUI for install/remove operations
 - Job file is JSON with `action`, `source`, and `packages` fields
+
+### Command Output Panel
+
+- A third panel (QTextEdit) appears at the bottom of the right side showing live CLI output
+- Displays stdout/stderr from the worker process running package operations
+- Shows DNF, Flatpak, or Snap command output during installation/removal
+- Panel remains visible after operations complete, allowing users to review output
+- Output is streamed in real-time via QProcess signals (`readyReadStandardOutput`, `readyReadStandardError`)
+- **Note**: Backend install/remove methods stream output directly (no `capture_output=True`) so commands appear in the output panel
 
 ### Important Notes
 

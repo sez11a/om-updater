@@ -9,6 +9,7 @@ import signal
 import subprocess
 import os
 import re
+import threading
 from PyQt6.QtWidgets import (
     QApplication, QSystemTrayIcon, QMenu, QDialog,
     QVBoxLayout, QHBoxLayout, QLabel, QListWidget,
@@ -28,25 +29,57 @@ class DNFBackend:
         pass
     
     def run_update(self):
-        print("STATUS: Updating system packages...", flush=True)
+        print("STATUS: Clearing DNF cache...", flush=True)
         try:
-            result = subprocess.run(
-                ["dnf", "dsync", "--allowerasing", "-y"],
-                capture_output=True, text=True, timeout=600
+            subprocess.run(
+                ["dnf", "clean", "all"],
+                capture_output=True, text=True, timeout=120
             )
-            if result.stdout:
-                for line in result.stdout.splitlines()[-50:]:
-                    print(line, flush=True)
-            if result.returncode == 0:
+        except Exception as e:
+            print(f"WARNING: cache clean failed: {e}", flush=True)
+
+        print("STATUS: Updating system packages...", flush=True)
+        return self._run_streaming_update()
+
+    def _run_streaming_update(self) -> int:
+        try:
+            proc = subprocess.Popen(
+                ["dnf", "dsync", "--allowerasing", "-y", "--refresh"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, bufsize=1
+            )
+
+            def _pump(stream):
+                for line in iter(stream.readline, ""):
+                    print(line, end="", flush=True)
+                stream.close()
+
+            readers = [
+                threading.Thread(target=_pump, args=(proc.stdout,)),
+                threading.Thread(target=_pump, args=(proc.stderr,)),
+            ]
+            for t in readers:
+                t.daemon = True
+                t.start()
+
+            try:
+                code = proc.wait(timeout=600)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                for t in readers:
+                    t.join()
+                print("ERROR: DNF update timed out", flush=True)
+                return 1
+
+            for t in readers:
+                t.join()
+
+            if code == 0:
                 print("STATUS: Update completed successfully", flush=True)
             else:
-                print(f"STATUS: Update finished with code {result.returncode}", flush=True)
-                if result.stderr:
-                    print(result.stderr, flush=True)
-            return result.returncode
-        except subprocess.TimeoutExpired:
-            print("ERROR: DNF update timed out", flush=True)
-            return 1
+                print(f"STATUS: Update finished with code {code}", flush=True)
+            return code
         except Exception as e:
             print(f"ERROR: {str(e)}", flush=True)
             return 1
@@ -351,6 +384,14 @@ class OMUpdater(QApplication):
                     pct = int(line.replace("PROGRESS:", "").strip().replace("%", ""))
                 except ValueError:
                     pass
+
+            elif line.startswith("[") and "/" in line:
+                match = re.match(r"\[(\d+)/(\d+)\]", line)
+                if match:
+                    cur, total = int(match.group(1)), int(match.group(2))
+                    if total:
+                        pct = int(cur * 100 / total)
+                        self._update_progress(pct, "Running transaction...")
             
             elif "Updating:" in line or "Update:" in line:
                 match = re.search(r'(\d+)%', line)

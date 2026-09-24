@@ -164,8 +164,7 @@ class RPMBackend(BaseBackend):
     def install(self, package_name: str) -> bool:
         try:
             result = subprocess.run(
-                ["dnf", "install", "-y", package_name],
-                timeout=300
+                ["dnf", "install", "-y", package_name]
             )
             return result.returncode == 0
         except Exception as e:
@@ -175,8 +174,7 @@ class RPMBackend(BaseBackend):
     def remove(self, package_name: str) -> bool:
         try:
             result = subprocess.run(
-                ["dnf", "remove", "-y", package_name],
-                timeout=60
+                ["dnf", "remove", "-y", package_name]
             )
             return result.returncode == 0
         except Exception as e:
@@ -265,8 +263,7 @@ class FlatpakBackend(BaseBackend):
         try:
             scope = "--user" if user else "--system"
             result = subprocess.run(
-                ["flatpak", "install", scope, "-y", package_name],
-                timeout=300
+                ["flatpak", "install", scope, "-y", package_name]
             )
             return result.returncode == 0
         except Exception as e:
@@ -277,8 +274,7 @@ class FlatpakBackend(BaseBackend):
         try:
             scope = "--user" if user else "--system"
             result = subprocess.run(
-                ["flatpak", "remove", scope, "-y", package_name],
-                timeout=60
+                ["flatpak", "remove", scope, "-y", package_name]
             )
             return result.returncode == 0
         except Exception as e:
@@ -365,8 +361,7 @@ class SnapBackend(BaseBackend):
     def install(self, package_name: str) -> bool:
         try:
             result = subprocess.run(
-                ["snap", "install", package_name],
-                timeout=300
+                ["snap", "install", package_name]
             )
             return result.returncode == 0
         except Exception as e:
@@ -376,8 +371,7 @@ class SnapBackend(BaseBackend):
     def remove(self, package_name: str) -> bool:
         try:
             result = subprocess.run(
-                ["snap", "remove", package_name],
-                timeout=60
+                ["snap", "remove", package_name]
             )
             return result.returncode == 0
         except Exception as e:
