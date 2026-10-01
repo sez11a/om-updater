@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QMenu, QMessageBox, QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem,
     QHeaderView, QTextEdit
 )
-from PyQt6.QtCore import QProcess, Qt, QSize, QTimer
+from PyQt6.QtCore import QProcess, Qt, QSize, QTimer, QThread, pyqtSignal
 from PyQt6.QtGui import QIcon, QPainter, QColor, QPixmap, QTextCursor
 
 try:
@@ -396,11 +396,6 @@ class SnapBackend(BaseBackend):
         return info
 
 
-def handle_sigint(signum, frame):
-    print("\nReceived Ctrl-C, shutting down...", flush=True)
-    QApplication.quit()
-
-
 class OMInstaller(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -413,7 +408,9 @@ class OMInstaller(QMainWindow):
         self.search_text = ""
         self.current_category = "RPM"
         self.is_installing = False
+        self.is_loading = False
         self.worker_output: Optional[QTextEdit] = None
+        self.search_worker: Optional[QThread] = None
         
         self._setup_backends()
         self._setup_ui()
@@ -483,7 +480,8 @@ class OMInstaller(QMainWindow):
         self.worker_output_label.hide()
         
         right_layout.addLayout(search_layout)
-        right_layout.addWidget(QLabel(f"Category: {self.current_category}"))
+        self.category_label = QLabel(f"Category: {self.current_category}")
+        right_layout.addWidget(self.category_label)
         right_layout.addWidget(self.package_list)
         right_layout.addWidget(self.worker_output_label)
         right_layout.addWidget(self.worker_output)
@@ -515,16 +513,50 @@ class OMInstaller(QMainWindow):
     def _load_packages(self, category: str):
         if category not in self.backends:
             return
-        
+
         self.current_category = category
-        backend = self.backends[category]
         self.packages[category] = []
-        
-        packages = backend.search(self.search_text) if self.search_text else backend.search("")
+
+        # Let any in-flight worker finish and clean itself up. Its result is
+        # ignored by the category check in the handlers below.
+        old = self.search_worker
+        if old is not None:
+            old.finished.connect(old.deleteLater)
+            self.search_worker = None
+
+        self._show_loading_state(category)
+
+        self.search_worker = SearchWorker(category, self.search_text, self.backends[category], self)
+        self.search_worker.search_done.connect(self._on_search_finished)
+        self.search_worker.search_failed_sig.connect(self._on_search_failed)
+        self.search_worker.finished.connect(self.search_worker.deleteLater)
+        self.search_worker.finished.connect(lambda: self._maybe_clear_worker())
+        self.search_worker.start()
+
+    def _maybe_clear_worker(self):
+        if self.search_worker is not None and not self.search_worker.isRunning():
+            self.search_worker = None
+
+    def _show_loading_state(self, category: str):
+        self.package_list.blockSignals(True)
+        self.package_list.clear()
+        self.package_list.addTopLevelItem(QTreeWidgetItem([f"Searching {category}…", "", ""]))
+        self.package_list.blockSignals(False)
+
+    def _on_search_finished(self, category: str, packages: list[Package]):
+        if category != self.current_category:
+            return
         self.packages[category] = packages
-        
+        self.is_loading = False
         self._refresh_package_list()
-    
+
+    def _on_search_failed(self, category: str, error: str):
+        if category != self.current_category:
+            return
+        self.packages[category] = []
+        self.is_loading = False
+        self._append_to_output(f"Search failed for {category}: {error}\n")
+
     def _refresh_package_list(self):
         self.package_list.clear()
         packages = self.packages.get(self.current_category, [])
@@ -541,8 +573,6 @@ class OMInstaller(QMainWindow):
                 item.setForeground(0, QColor(0, 180, 0))
                 item.setForeground(1, QColor(0, 180, 0))
                 item.setForeground(2, QColor(0, 180, 0))
-            
-            self.package_list.addTopLevelItem(item)
     
     def _append_to_output(self, text: str):
         if self.worker_output:
@@ -556,6 +586,7 @@ class OMInstaller(QMainWindow):
         if item:
             category = item.data(Qt.ItemDataRole.UserRole)
             self.current_category = category
+            self.category_label.setText(f"Category: {category}")
             self._load_packages(category)
     
     def _on_searchExecuted(self):
@@ -657,6 +688,10 @@ class OMInstaller(QMainWindow):
     
     def _install_selected(self, packages: list[Package]):
         if not packages:
+            return
+        
+        if self.is_installing:
+            QMessageBox.warning(self, "Busy", "Another operation is already in progress.")
             return
         
         pkg_names = ", ".join([p.name for p in packages])
@@ -769,6 +804,24 @@ class OMInstaller(QMainWindow):
         return QIcon(pix)
 
 
+class SearchWorker(QThread):
+    search_done = pyqtSignal(str, list)
+    search_failed_sig = pyqtSignal(str, str)
+
+    def __init__(self, category: str, query: str, backend: BaseBackend, parent=None):
+        super().__init__(parent)
+        self.category = category
+        self.query = query
+        self.backend = backend
+
+    def run(self):
+        try:
+            packages = self.backend.search(self.query)
+            self.search_done.emit(self.category, packages)
+        except Exception as e:
+            self.search_failed_sig.emit(self.category, str(e))
+
+
 def run_worker(job_file: str):
     with open(job_file, 'r') as f:
         job_data = json.load(f)
@@ -820,17 +873,23 @@ def main():
         exit_code = run_worker(job_file) if job_file else 1
         sys.exit(exit_code)
     
-    signal.signal(signal.SIGINT, handle_sigint)
+    # SIGINT is routed through the event loop via a single-shot-per-tick timer so
+    # Ctrl-C cleanly quits without blocking inside app.exec().
     app = QApplication(sys.argv)
-    
+
+    quit_timer = QTimer()
+    quit_timer.setSingleShot(True)
+
+    def _on_sigint():
+        print("\nReceived Ctrl-C, shutting down...", flush=True)
+        quit_timer.start(0)
+
+    quit_timer.timeout.connect(app.quit)
+    signal.signal(signal.SIGINT, _on_sigint)
+
     installer = OMInstaller()
     installer.show()
-    QApplication.processEvents()
-    
-    timer = QTimer()
-    timer.start(200)
-    timer.timeout.connect(QApplication.processEvents)
-    
+
     sys.exit(app.exec())
 
 
