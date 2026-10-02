@@ -1,4 +1,4 @@
-# Project: OpenMandriva Updater
+# Project: OpenMandriva Updater and Installer
 
 ## Quick Start
 
@@ -113,3 +113,13 @@ python3 om-installer.py
 - **QApplication must be created BEFORE any QWidget** - this was the original bug causing "QWidget: Must construct a QApplication before a QWidget"
 - Signal blocking is used during UI initialization to prevent crashes from early signal emission
 - Installed packages displayed in green text for visual distinction
+
+## GUI Threading (read before touching Qt code)
+
+Both `om-updater.py` and `om-installer.py` are PyQt6 apps. Keep all blocking
+work (subprocess, DNF, network, `QProcess` waits) off the GUI thread, and let
+`app.exec()` own the event loop. Load the `gui-threading` skill before editing
+either file, and follow it when a Qt app freezes, deadlocks, or aborts (SIGABRT)
+inside a slot or on click.
+
+- **Skill**: `./.agents/gui-threading/SKILL.md`
