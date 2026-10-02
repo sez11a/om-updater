@@ -24,13 +24,6 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import QProcess, Qt, QSize, QTimer, QThread, pyqtSignal
 from PyQt6.QtGui import QIcon, QPainter, QColor, QPixmap, QTextCursor
 
-try:
-    import libdnf5.base
-    import libdnf5.rpm
-except ImportError:
-    libdnf5 = None
-    libdnf5.rpm = None
-
 
 class InstallAction(Enum):
     NONE = ""

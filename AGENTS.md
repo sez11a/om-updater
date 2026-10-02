@@ -18,30 +18,21 @@ python om-updater.py
 - **No updates**: green tray icon, tooltip "System up to date."
 - **Updates available**: red icon with "!", tooltip "System needs updating."
 - Clicking icon when updates are available shows confirmation dialog
-- **Update All**: runs RPM update first (via libdnf5 API), then Flatpak updates (via shell commands)
+- **Update All**: runs RPM update first (via CLI), then Flatpak updates (via shell commands)
 - Worker mode (`--worker` flag) requires `pkexec` for privileged access
 
 ## Update Commands
 
-- **RPM updates**: Uses `libdnf5.base.Goal.add_rpm_distro_sync()` with `set_allow_erasing(True)` via `pkexec`
+- **RPM updates**: Uses RPM CLI (`dnf dsync --allowerasing --refresh`) via `pkexec`
 - **Flatpak updates**: Uses shell commands (`flatpak update --user` and `pkexec flatpak update --system`)
 
-**Critical**: OpenMandriva requires `distro-sync` (not `upgrade`) for system updates. The CLI command is `sudo dnf dsync --allowerasing`.
+**Critical**: OpenMandriva requires `distro-sync` (not `upgrade`) for system updates. The CLI command is `sudo dnf dsync --allowerasing`. Do **not** use `dnf update`/`dnf upgrade` (Fedora behavior), which will not work correctly here.
 
 ## Environment
 
 - Requires: `python3`, `PyQt6`, `dnf`, `pkexec`, `flatpak`
 - Desktop: KDE Plasma (system tray dependent)
 - Cache: Clear DNF cache at worker startup with `dnf clean all` to ensure fresh metadata
-
-## libdnf5 API Requirements
-
-- Create a fresh `Base()` instance for each worker run
-- Call `base.setup()` then `repo_sack.load_repos()` to initialize repositories
-- Use `add_rpm_distro_sync()` with `set_allow_erasing(True)` for OpenMandriva (NOT `add_rpm_upgrade()`)
-- Always call `transaction.run()` after `goal.resolve()` to actually apply changes
-- Do not try to modify config after `setup()` - options are locked
-- DNF cache must be cleared at worker startup with `dnf clean all` to avoid stale metadata
 
 ## Signal Handling
 
@@ -65,7 +56,6 @@ To build an RPM package for OpenMandriva:
 
 **Package requirements** (OpenMandriva naming):
 - `python-qt6-core`, `python-qt6-widgets` (not `python3-pyqt6`)
-- `python-libdnf5` is provided by `python-dnf` >= 5.0 (DNF 5)
 - `dnf5`, `flatpak`
 
 **Important**: OpenMandriva uses different package names than other distros. Always verify package names with `dnf search` or `rpm -qa`.
