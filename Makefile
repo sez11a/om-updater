@@ -15,8 +15,8 @@ tarball:
 	@mkdir -p $(BUILD_DIR)/$(NAME)-$(VERSION)/icons
 	@cp om-updater.py $(BUILD_DIR)/$(NAME)-$(VERSION)/
 	@cp om-installer.py $(BUILD_DIR)/$(NAME)-$(VERSION)/
-	@cp .abf.yml $(BUILD_DIR)/$(NAME)-$(VERSION)/
-	@cp om-updater.spec $(BUILD_DIR)/$(NAME)-$(VERSION)/
+	#@cp .abf.yml $(BUILD_DIR)/$(NAME)-$(VERSION)/
+	#@cp om-updater.spec $(BUILD_DIR)/$(NAME)-$(VERSION)/
 	@cp icons/om-updater.png $(BUILD_DIR)/$(NAME)-$(VERSION)/icons/
 	@cp icons/om-installer.png $(BUILD_DIR)/$(NAME)-$(VERSION)/icons/
 	@mkdir -p $(DIST_DIR)
