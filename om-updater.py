@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
 """
 OpenMandriva KDE Plasma System Tray Updater with Flatpak support
-Fixed Flatpak update logic: uses --assumeyes --noninteractive + separate user/system handling
+
+DESIGN: Uses a single worker process for all updates to minimize password prompts.
+When updating all packages, the same pkexec invocation handles both DNF and Flatpak updates,
+so the user only needs to authenticate once.
+
+The worker processes:
+1. DNF system updates via dnf dsync
+2. User Flatpak updates via flatpak update --user
+3. System Flatpak updates via flatpak update --system (no inner pkexec needed!)
+
+The key insight: Since the worker runs as root via pkexec, nested pkexec calls are avoided.
 """
 
 import sys
@@ -10,6 +20,7 @@ import subprocess
 import os
 import re
 import threading
+import pwd
 from PyQt6.QtWidgets import (
     QApplication, QSystemTrayIcon, QMenu, QDialog,
     QVBoxLayout, QHBoxLayout, QLabel, QListWidget,
@@ -25,10 +36,14 @@ def handle_sigint(signum, frame):
 
 
 class DNFBackend:
-    def __init__(self):
-        pass
+    def __init__(self, user_name: str | None = None):
+        self.user_name = user_name
     
-    def run_update(self):
+    def run_update(self, update_type: str = "all"):
+        """Run updates based on type: 'all', 'rpm', 'flatpak'"""
+        exit_code = 0
+        
+        # Always clear DNF cache first for fresh metadata
         print("STATUS: Clearing DNF cache...", flush=True)
         try:
             subprocess.run(
@@ -38,8 +53,21 @@ class DNFBackend:
         except Exception as e:
             print(f"WARNING: cache clean failed: {e}", flush=True)
 
-        print("STATUS: Updating system packages...", flush=True)
-        return self._run_streaming_update()
+        # Handle RPM/DNF updates
+        if update_type in ("all", "rpm"):
+            print("STATUS: Updating system packages...", flush=True)
+            code = self._run_streaming_update()
+            if code != 0:
+                exit_code = code
+
+        # Handle Flatpak updates
+        if update_type in ("all", "flatpak"):
+            print("STATUS: Updating Flatpak packages...", flush=True)
+            code = self._run_flatpak_updates()
+            if code != 0 and exit_code == 0:
+                exit_code = code
+
+        return exit_code
 
     def _run_streaming_update(self) -> int:
         try:
@@ -76,13 +104,103 @@ class DNFBackend:
                 t.join()
 
             if code == 0:
-                print("STATUS: Update completed successfully", flush=True)
+                print("STATUS: RPM update completed successfully", flush=True)
             else:
-                print(f"STATUS: Update finished with code {code}", flush=True)
+                print(f"STATUS: RPM update finished with code {code}", flush=True)
             return code
         except Exception as e:
             print(f"ERROR: {str(e)}", flush=True)
             return 1
+
+    def _run_flatpak_updates(self) -> int:
+        """Update both user and system flatpaks.
+        
+        Uses shell commands with proper environment for flatpak to work correctly
+        when running as root via pkexec.
+        """
+        exit_code = 0
+        display = os.environ.get("DISPLAY", "")
+        wayland_display = os.environ.get("WAYLAND_DISPLAY", "")
+        dbus_bus = os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")
+        # Under pkexec, USER is "root". Fall back to the real user passed from the GUI.
+        current_user = self.user_name or os.environ.get("USER", os.environ.get("USERNAME", ""))
+        
+        user_home = os.environ.get("HOME", "/root")
+        user_uid = os.getuid()
+        if current_user:
+            try:
+                user_info = pwd.getpwnam(current_user)
+                user_home = user_info.pw_dir
+                user_uid = user_info.pw_uid
+            except Exception:
+                user_home = f"/home/{current_user}"
+        
+        # Construct the user's runtime dir (pkexec may set XDG_RUNTIME_DIR to root's)
+        xdg_runtime_dir = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{user_uid}")
+        
+        # User Flatpak updates — must run as the real user (not root)
+        # Flatpak refuses to operate on --user installations as root for safety
+        print("=== User Flatpaks Update ===", flush=True)
+        if current_user:
+            user_cmd = f'''
+export DISPLAY="{display}"
+export WAYLAND_DISPLAY="{wayland_display}"
+export DBUS_SESSION_BUS_ADDRESS="{dbus_bus}"
+runuser -u "{current_user}" -- env \\
+  HOME="{user_home}" \\
+  XDG_RUNTIME_DIR="{xdg_runtime_dir}" \\
+  flatpak update --user --assumeyes --noninteractive
+'''
+        else:
+            user_cmd = f'''
+export DISPLAY="{display}"
+export WAYLAND_DISPLAY="{wayland_display}"
+export DBUS_SESSION_BUS_ADDRESS="{dbus_bus}"
+export HOME="{user_home}"
+flatpak update --user --assumeyes --noninteractive
+'''
+        try:
+            result = subprocess.run(
+                ["bash", "-c", user_cmd],
+                capture_output=True, text=True, timeout=300
+            )
+            if result.stdout:
+                print(result.stdout, end="", flush=True)
+            if result.stderr:
+                print(result.stderr, end="", flush=True)
+            if result.returncode == 0:
+                print("STATUS: User Flatpak updates completed", flush=True)
+            else:
+                print("WARNING: User Flatpak update had warnings", flush=True)
+                if exit_code == 0:
+                    exit_code = result.returncode
+        except Exception as e:
+            print(f"WARNING: User Flatpak update failed: {e}", flush=True)
+
+        # System Flatpak updates - runs as root (no inner pkexec needed)
+        print("=== System Flatpaks Update ===", flush=True)
+        system_cmd = '''
+flatpak update --system --assumeyes --noninteractive
+'''
+        try:
+            result = subprocess.run(
+                ["bash", "-c", system_cmd],
+                capture_output=True, text=True, timeout=300
+            )
+            if result.stdout:
+                print(result.stdout, end="", flush=True)
+            if result.stderr:
+                print(result.stderr, end="", flush=True)
+            if result.returncode == 0:
+                print("STATUS: System Flatpak updates completed", flush=True)
+            else:
+                print("WARNING: System Flatpak update had warnings", flush=True)
+                if exit_code == 0:
+                    exit_code = result.returncode
+        except Exception as e:
+            print(f"WARNING: System Flatpak update failed: {e}", flush=True)
+
+        return exit_code
 
 class OMUpdater(QApplication):
     def __init__(self):
@@ -143,6 +261,7 @@ class OMUpdater(QApplication):
     def check_for_updates(self):
         if self.update_in_progress:
             return
+        
         self.rpm_updates = self._check_rpm_updates()
         self.flatpak_updates = self._check_flatpak_updates()
 
@@ -156,7 +275,14 @@ class OMUpdater(QApplication):
             self.tray.setIcon(self.green_icon)
             self.tray.setToolTip("System up to date.")
 
-    # ... ( _check_rpm_updates, _parse_rpm_list, _check_flatpak_updates remain exactly the same as previous version )
+    def _refresh_package_lists(self):
+        """Refresh package and flatpak metadata before checking for updates."""
+        # Refresh DNF metadata
+        try:
+            subprocess.run(["dnf", "clean", "all"], capture_output=True, timeout=30)
+            subprocess.run(["dnf", "makecache"], capture_output=True, timeout=60)
+        except Exception:
+            pass
 
     def _check_rpm_updates(self) -> list[str]:
         try:
@@ -183,33 +309,75 @@ class OMUpdater(QApplication):
         return packages
 
     def _check_flatpak_updates(self) -> list[str]:
+        """Check for available flatpak updates."""
         updates = []
-
-        # User Flatpaks
+        
+        # Get user info for proper flatpak user context
+        current_user = os.environ.get("USER", os.environ.get("USERNAME", ""))
+        if current_user:
+            try:
+                user_info = pwd.getpwnam(current_user)
+                user_home = user_info.pw_dir
+            except Exception:
+                user_home = f"/home/{current_user}"
+        else:
+            user_home = os.environ.get("HOME", "/root")
+        
+        # Refresh appstream first to ensure current metadata
+        # Check user updates
         try:
-            result = subprocess.run(
-                ["flatpak", "remote-ls", "--updates", "--user"],
+            subprocess.run(
+                ["bash", "-c", f'HOME="{user_home}" flatpak update --user --appstream --assumeyes'],
                 capture_output=True, text=True, timeout=60
             )
-            if result.returncode == 0:
-                for line in result.stdout.splitlines():
+        except Exception:
+            pass
+        
+        try:
+            result = subprocess.run(
+                ["bash", "-c", f'HOME="{user_home}" flatpak update --user'],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=120
+            )
+            output = result.stdout
+            # If "Nothing to update" is NOT in output, there are updates
+            if "Nothing to update" not in output:
+                # Parse lines like "1.  app.name	version	branch	repo	size"
+                for line in output.splitlines():
                     line = line.strip()
-                    if line and not line.startswith(("Name", "===")):
-                        updates.append(f"[User] {line}")
+                    # Match lines like "1.  org.signal.Signal\t8.32.0\tstable\tflathub\t< 158.0 MB"
+                    match = re.match(r'^\d+\.\s+([a-zA-Z0-9._-]+)', line)
+                    if match:
+                        app_id = match.group(1)
+                        if app_id not in updates:
+                            updates.append(f"[User] {app_id}")
         except Exception as e:
             print(f"User Flatpak check failed: {e}")
 
-        # System Flatpaks
+        # Refresh appstream for system
         try:
-            result = subprocess.run(
-                ["flatpak", "remote-ls", "--updates", "--system"],
+            subprocess.run(
+                ["flatpak", "update", "--system", "--appstream", "--assumeyes"],
                 capture_output=True, text=True, timeout=60
             )
-            if result.returncode == 0:
-                for line in result.stdout.splitlines():
+        except Exception:
+            pass
+            
+        try:
+            result = subprocess.run(
+                ["bash", "-c", "flatpak update --system"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, timeout=120
+            )
+            output = result.stdout
+            if "Nothing to update" not in output:
+                for line in output.splitlines():
                     line = line.strip()
-                    if line and not line.startswith(("Name", "===")):
-                        updates.append(f"[System] {line}")
+                    match = re.match(r'^\d+\.\s+([a-zA-Z0-9._-]+)', line)
+                    if match:
+                        app_id = match.group(1)
+                        if app_id not in updates:
+                            updates.append(f"[System] {app_id}")
         except Exception as e:
             print(f"System Flatpak check failed: {e}")
 
@@ -310,36 +478,31 @@ class OMUpdater(QApplication):
 
         display = os.environ.get("DISPLAY", "")
         wayland_display = os.environ.get("WAYLAND_DISPLAY", "")
+        dbus_bus = os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")
+        script_path = os.path.abspath(sys.argv[0])
+        real_user = os.environ.get("USER", os.environ.get("USERNAME", ""))
 
         if update_type == "all":
             self.progress_bar.setRange(0, 0)
-            self.status_label.setText("Updating RPM packages...")
-            script_path = os.path.abspath(sys.argv[0])
-            script = f'export DISPLAY="{display}" WAYLAND_DISPLAY="{wayland_display}"; pkexec python3 -u "{script_path}" --worker'
+            self.status_label.setText("Updating all packages (RPM and Flatpak)...")
+            script = f'export DISPLAY="{display}" WAYLAND_DISPLAY="{wayland_display}" DBUS_SESSION_BUS_ADDRESS="{dbus_bus}"; pkexec python3 -u "{script_path}" --worker --user-name="{real_user}"'
             self.process.setProgram("bash")
             self.process.setArguments(["-c", script])
-            self.process.finished.connect(self._on_rpm_update_finished)
+            self.process.finished.connect(self._update_finished)
         elif update_type == "rpm":
             self.progress_bar.setRange(0, 0)
             self.status_label.setText("Updating RPM packages...")
-            script_path = os.path.abspath(sys.argv[0])
-            script = f'export DISPLAY="{display}" WAYLAND_DISPLAY="{wayland_display}"; pkexec python3 -u "{script_path}" --worker'
+            script = f'export DISPLAY="{display}" WAYLAND_DISPLAY="{wayland_display}" DBUS_SESSION_BUS_ADDRESS="{dbus_bus}"; pkexec python3 -u "{script_path}" --worker --rpm-only --user-name="{real_user}"'
             self.process.setProgram("bash")
             self.process.setArguments(["-c", script])
             self.process.finished.connect(self._update_finished)
         elif update_type == "flatpak":
             self.progress_bar.setRange(0, 0)
             self.status_label.setText("Updating Flatpak packages...")
-            self.process.finished.connect(self._update_finished)
-            script = (
-                f'echo "=== User Flatpaks Update ==="\n'
-                f'flatpak update --user --assumeyes --noninteractive || echo "User Flatpak update had warnings"\n'
-                f'echo "\n=== System Flatpaks Update ==="\n'
-                f'export DISPLAY="{display}" WAYLAND_DISPLAY="{wayland_display}"; pkexec flatpak update --system --assumeyes --noninteractive || echo "System Flatpak update had warnings"\n'
-                f'echo "\n=== Update process finished ===\n"'
-            )
+            script = f'export DISPLAY="{display}" WAYLAND_DISPLAY="{wayland_display}" DBUS_SESSION_BUS_ADDRESS="{dbus_bus}"; pkexec python3 -u "{script_path}" --worker --flatpak-only --user-name="{real_user}"'
             self.process.setProgram("bash")
             self.process.setArguments(["-c", script])
+            self.process.finished.connect(self._update_finished)
         else:
             # This should not be reached
             self.process.setProgram("echo")
@@ -411,28 +574,6 @@ class OMUpdater(QApplication):
                 pkg_info = line.replace("INSTALLED:", "").strip()
                 self.status_label.setText(f"Installed: {pkg_info[:50]}")
 
-    def _on_rpm_update_finished(self):
-        print("_on_rpm_update_finished called")
-        self.output_text.appendPlainText("\n✅ RPM update completed!")
-        self.output_text.appendPlainText("\n=== Starting Flatpak Update ===\n")
-        self.progress_bar.setRange(0, 0)
-        self.status_label.setText("Updating Flatpak packages...")
-        self.process.finished.disconnect()
-        self.process.finished.connect(self._update_finished)
-        display = os.environ.get("DISPLAY", "")
-        wayland_display = os.environ.get("WAYLAND_DISPLAY", "")
-        script = (
-            f'echo "=== User Flatpaks Update ==="\n'
-            f'flatpak update --user --assumeyes --noninteractive || echo "User Flatpak update had warnings"\n'
-            f'echo "\n=== System Flatpaks Update ==="\n'
-            f'export DISPLAY="{display}" WAYLAND_DISPLAY="{wayland_display}"; pkexec flatpak update --system --assumeyes --noninteractive || echo "System Flatpak update had warnings"\n'
-            f'echo "\n=== Update process finished ===\n"'
-        )
-        self.process.setProgram("bash")
-        self.process.setArguments(["-c", script])
-        print("Starting Flatpak process...")
-        self.process.start()
-
     def _update_finished(self):
         print("_update_finished called")
         code = self.process.exitCode()
@@ -445,15 +586,48 @@ class OMUpdater(QApplication):
             self._update_progress(0, "⚠️ Update completed with warnings")
 
         self.update_in_progress = False
-        self.output_text.appendPlainText("\nUpdate process finished. You may close this window.")
-        self.check_for_updates()
+        self.output_text.appendPlainText("\nUpdate process finished. Waiting for metadata refresh...")
+        
+        # Wait for metadata to settle, then check status
+        QTimer.singleShot(3000, self._post_update_check)
+    
+    def _post_update_check(self):
+        """Check for updates after a delay, allowing metadata to refresh."""
+        # Check for updates directly (don't refresh metadata - flatpak handles this)
+        self.rpm_updates = self._check_rpm_updates()
+        self.flatpak_updates = self._check_flatpak_updates()
+        
+        self.updates_available = bool(self.rpm_updates) or bool(self.flatpak_updates)
+        
+        self.output_text.appendPlainText(f"\nUpdate check: RPM updates: {len(self.rpm_updates)}, Flatpak updates: {len(self.flatpak_updates)}")
+
+        if self.updates_available:
+            self.tray.setIcon(self.red_icon)
+            count = len(self.rpm_updates) + len(self.flatpak_updates)
+            self.tray.setToolTip(f"System needs updating ({count} updates)")
+        else:
+            self.tray.setIcon(self.green_icon)
+            self.tray.setToolTip("System up to date.")
 
 
 if __name__ == "__main__":
     if "--worker" in sys.argv:
         sys.stdout.reconfigure(line_buffering=True)
-        backend = DNFBackend()
-        exit_code = backend.run_update()
+        # Parse update type from arguments
+        update_type = "all"
+        if "--rpm-only" in sys.argv:
+            update_type = "rpm"
+        elif "--flatpak-only" in sys.argv:
+            update_type = "flatpak"
+        
+        # The real desktop user (not "root") — passed by the GUI before pkexec
+        user_name = None
+        for arg in sys.argv:
+            if arg.startswith("--user-name="):
+                user_name = arg.split("=", 1)[1]
+        
+        backend = DNFBackend(user_name=user_name)
+        exit_code = backend.run_update(update_type)
         sys.exit(exit_code if exit_code else 0)
 
     app = OMUpdater()
