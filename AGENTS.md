@@ -86,7 +86,8 @@ python3 om-installer.py
 ### Worker Mode
 
 - Run with `--worker JOB_FILE` flag for privileged package operations
-- Spawned via `pkexec` from the main GUI for install/remove operations
+- Spawned via `pkexec` from the main GUI for RPM/Snap install/remove operations
+- Flatpak workers are spawned directly (no `pkexec`): installs/removes default to `--user` scope and need no elevation
 - Job file is JSON with `action`, `source`, and `packages` fields
 
 ### Command Output Panel

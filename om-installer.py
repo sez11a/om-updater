@@ -722,7 +722,10 @@ class OMInstaller(QMainWindow):
         msg = QMessageBox(self)
         msg.setWindowTitle("Confirm Installation")
         msg.setText(f"Install {len(packages)} package(s):\n{pkg_names}")
-        msg.setInformativeText("This will require administrator privileges.")
+        if self.current_category == "Flatpak":
+            msg.setInformativeText("Flatpak packages install for the current user only.")
+        else:
+            msg.setInformativeText("This will require administrator privileges.")
         msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         msg.setDefaultButton(QMessageBox.StandardButton.Yes)
         
@@ -737,7 +740,10 @@ class OMInstaller(QMainWindow):
         msg = QMessageBox(self)
         msg.setWindowTitle("Confirm Removal")
         msg.setText(f"Remove {len(packages)} package(s):\n{pkg_names}")
-        msg.setInformativeText("This will require administrator privileges.")
+        if self.current_category == "Flatpak":
+            msg.setInformativeText("Flatpak packages are removed for the current user only.")
+        else:
+            msg.setInformativeText("This will require administrator privileges.")
         msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         msg.setDefaultButton(QMessageBox.StandardButton.Yes)
         
@@ -757,8 +763,15 @@ class OMInstaller(QMainWindow):
         self.is_installing = True
         
         self.install_process = QProcess(self)
-        self.install_process.setProgram("pkexec")
-        self.install_process.setArguments(["python3", "-u", worker_script, "--worker", job_file])
+        if self.current_category == "Flatpak":
+            # Flatpak operations default to --user scope, which needs no
+            # elevation. Running the worker as the real user also ensures
+            # packages land in the user's flatpak dir, not root's.
+            self.install_process.setProgram(sys.executable)
+            self.install_process.setArguments(["-u", worker_script, "--worker", job_file])
+        else:
+            self.install_process.setProgram("pkexec")
+            self.install_process.setArguments(["python3", "-u", worker_script, "--worker", job_file])
         self.install_process.finished.connect(self._on_install_finished)
         self.install_process.readyReadStandardOutput.connect(self._on_worker_output)
         self.install_process.readyReadStandardError.connect(self._on_worker_error)
