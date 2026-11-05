@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 NAME := om-updater
-VERSION := 1.0.7
+VERSION := 1.0.8
 TARBALL := $(NAME)-$(VERSION).tar.gz
 BUILD_DIR := /tmp/$(NAME)-build-$(VERSION)
 DIST_DIR := $(CURDIR)/dist

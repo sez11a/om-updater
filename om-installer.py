@@ -208,6 +208,12 @@ class FlatpakBackend(BaseBackend):
     def search(self, query: str) -> list[Package]:
         packages = []
         
+        # An empty query must not trigger a search: flatpak falls back to a
+        # full repository search, which is slow and returns every app. Only
+        # search once the user actually typed something.
+        if not query or not query.strip():
+            return packages
+        
         for scope in ["--user", "--system"]:
             try:
                 result = subprocess.run(
@@ -215,38 +221,45 @@ class FlatpakBackend(BaseBackend):
                     capture_output=True, text=True, timeout=30
                 )
                 if result.returncode == 0:
-                    lines = result.stdout.strip().split('\n')[1:]
-                    for line in lines:
+                    for line in result.stdout.strip().split('\n'):
+                        line = line.strip()
+                        if not line or line.lower().startswith("looking up"):
+                            continue
                         parts = line.split('\t')
-                        if len(parts) >= 3:
-                            name = parts[0].strip()
-                            description = parts[1].strip() if len(parts) > 1 else ""
-                            version = parts[3].strip() if len(parts) > 3 else ""
-                            
-                            try:
-                                installed_result = subprocess.run(
-                                    ["flatpak", "info", f"{scope.replace('--', '')}:{name}"],
-                                    capture_output=True, text=True, timeout=10
-                                )
-                                installed_version = None
-                                if installed_result.returncode == 0:
-                                    for info_line in installed_result.stdout.split('\n'):
-                                        if info_line.startswith("Version"):
-                                            installed_version = info_line.split(":", 1)[1].strip()
-                                            break
-                            except:
-                                installed_version = None
-                            
-                            pkg = Package(
-                                name=name,
-                                source="Flatpak",
-                                description=description or name,
-                                installed_version=installed_version,
-                                latest_version=version if version else installed_version,
-                                size=None,
-                                repository=scope.replace('--', '')
+                        if len(parts) < 4 or parts[0].strip().lower() == "name":
+                            # Skip blank lines and header rows (flatpak versions
+                            # that print a header before the results) so result
+                            # rows are not shifted off by one.
+                            continue
+                        # Result row layout: Name, Description, ID, Version, Branch, Installation
+                        name = parts[2].strip()
+                        description = parts[1].strip() if len(parts) > 1 else ""
+                        version = parts[3].strip() if len(parts) > 3 else ""
+                        
+                        try:
+                            installed_result = subprocess.run(
+                                ["flatpak", "info", scope, name],
+                                capture_output=True, text=True, timeout=10
                             )
-                            packages.append(pkg)
+                            installed_version = None
+                            if installed_result.returncode == 0:
+                                for info_line in installed_result.stdout.split('\n'):
+                                    if info_line.strip().startswith("Version"):
+                                        installed_version = info_line.split(":", 1)[1].strip()
+                                        break
+                        except:
+                            installed_version = None
+                        
+                        pkg = Package(
+                            name=name,
+                            source="Flatpak",
+                            description=description or name,
+                            installed_version=installed_version,
+                            latest_version=version if version else installed_version,
+                            size=None,
+                            repository=scope.replace('--', '')
+                        )
+                        packages.append(pkg)
             except Exception as e:
                 print(f"Flatpak search error ({scope}): {e}", file=sys.stderr)
         
@@ -284,10 +297,11 @@ class FlatpakBackend(BaseBackend):
             )
             output = result.stdout
             for line in output.split('\n'):
-                if line.startswith("Description:"):
+                if line.strip().startswith("Description:"):
                     info["description"] = line.split(":", 1)[1].strip()
-                elif line.startswith("Installed:"):
-                    info["installed_version"] = line.split(":", 1)[1].strip()
+                elif line.strip().startswith("Version:"):
+                    info["version"] = line.split("Version:", 1)[1].strip()
+                    info["installed_version"] = info["version"]
             info["repository"] = package_name.split('.')[0] if '.' in package_name else ""
         except Exception as e:
             info["description"] = f"Error getting info: {e}"
@@ -296,7 +310,7 @@ class FlatpakBackend(BaseBackend):
     def is_installed(self, package_name: str) -> bool:
         try:
             result = subprocess.run(
-                ["flatpak", "info", f"--user,{package_name}"],
+                ["flatpak", "info", "--user", package_name],
                 capture_output=True, text=True, timeout=10
             )
             return result.returncode == 0
@@ -400,6 +414,7 @@ class OMInstaller(QMainWindow):
         self.packages: dict[str, list[Package]] = {}
         self.search_text = ""
         self.current_category = "RPM"
+        self.search_request = 0
         self.is_installing = False
         self.is_loading = False
         self.worker_output: Optional[QTextEdit] = None
@@ -511,7 +526,7 @@ class OMInstaller(QMainWindow):
         self.packages[category] = []
 
         # Let any in-flight worker finish and clean itself up. Its result is
-        # ignored by the category check in the handlers below.
+        # ignored by the staleness check in the handlers below.
         old = self.search_worker
         if old is not None:
             old.finished.connect(old.deleteLater)
@@ -519,7 +534,12 @@ class OMInstaller(QMainWindow):
 
         self._show_loading_state(category)
 
-        self.search_worker = SearchWorker(category, self.search_text, self.backends[category], self)
+        # Tag the request so results from a previous (superseded) search can
+        # be dropped instead of applied.
+        self.search_request += 1
+        request_id = self.search_request
+
+        self.search_worker = SearchWorker(category, self.search_text, self.backends[category], self, request_id)
         self.search_worker.search_done.connect(self._on_search_finished)
         self.search_worker.search_failed_sig.connect(self._on_search_failed)
         self.search_worker.finished.connect(self.search_worker.deleteLater)
@@ -536,15 +556,17 @@ class OMInstaller(QMainWindow):
         self.package_list.addTopLevelItem(QTreeWidgetItem([f"Searching {category}…", "", ""]))
         self.package_list.blockSignals(False)
 
-    def _on_search_finished(self, category: str, packages: list[Package]):
-        if category != self.current_category:
+    def _on_search_finished(self, category: str, packages: list[Package], request_id: int = 0):
+        if category != self.current_category or request_id != self.search_request:
+            # A newer search has superseded this result.
             return
         self.packages[category] = packages
         self.is_loading = False
         self._refresh_package_list()
 
-    def _on_search_failed(self, category: str, error: str):
-        if category != self.current_category:
+    def _on_search_failed(self, category: str, error: str, request_id: int = 0):
+        if category != self.current_category or request_id != self.search_request:
+            # A newer search has superseded this result.
             return
         self.packages[category] = []
         self.is_loading = False
@@ -553,6 +575,15 @@ class OMInstaller(QMainWindow):
     def _refresh_package_list(self):
         self.package_list.clear()
         packages = self.packages.get(self.current_category, [])
+        
+        if not packages:
+            if self.search_text.strip():
+                placeholder_text = f"No {self.current_category} packages found."
+            else:
+                placeholder_text = f"Type to search {self.current_category}..."
+            placeholder = QTreeWidgetItem(self.package_list)
+            placeholder.setText(0, placeholder_text)
+            return
         
         for pkg in packages:
             item = QTreeWidgetItem(self.package_list)
@@ -798,21 +829,22 @@ class OMInstaller(QMainWindow):
 
 
 class SearchWorker(QThread):
-    search_done = pyqtSignal(str, list)
-    search_failed_sig = pyqtSignal(str, str)
+    search_done = pyqtSignal(str, list, int)
+    search_failed_sig = pyqtSignal(str, str, int)
 
-    def __init__(self, category: str, query: str, backend: BaseBackend, parent=None):
+    def __init__(self, category: str, query: str, backend: BaseBackend, parent=None, request_id: int = 0):
         super().__init__(parent)
         self.category = category
         self.query = query
         self.backend = backend
+        self.request_id = request_id
 
     def run(self):
         try:
             packages = self.backend.search(self.query)
-            self.search_done.emit(self.category, packages)
+            self.search_done.emit(self.category, packages, self.request_id)
         except Exception as e:
-            self.search_failed_sig.emit(self.category, str(e))
+            self.search_failed_sig.emit(self.category, str(e), self.request_id)
 
 
 def run_worker(job_file: str):
