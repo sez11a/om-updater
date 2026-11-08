@@ -475,6 +475,8 @@ class OMInstaller(QMainWindow):
         header = self.package_list.header()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        # Enable multi-selection with Ctrl and Shift
+        self.package_list.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
         self.package_list.itemDoubleClicked.connect(self._on_package_double_clicked)
         self.package_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.package_list.customContextMenuRequested.connect(self._on_package_context_menu)
@@ -622,25 +624,33 @@ class OMInstaller(QMainWindow):
         if not item:
             return
         
-        pkg = item.data(0, Qt.ItemDataRole.UserRole)
-        if not pkg:
+        # Get all selected items for multi-selection support (Ctrl+Click, Shift+Click)
+        selected_items = self.package_list.selectedItems()
+        if not selected_items:
+            return
+        
+        # Get the first selected package to determine available actions
+        first_pkg = selected_items[0].data(0, Qt.ItemDataRole.UserRole)
+        if not first_pkg:
             return
         
         menu = QMenu()
         
-        if pkg.is_installed:
+        if first_pkg.is_installed:
             remove_action = menu.addAction("Mark for Remove")
-            remove_action.triggered.connect(lambda: self._mark_for_remove(pkg))
+            remove_action.triggered.connect(lambda: self._mark_selected_for_remove(selected_items))
         else:
             install_action = menu.addAction("Mark for Install")
-            install_action.triggered.connect(lambda: self._mark_for_install(pkg))
+            install_action.triggered.connect(lambda: self._mark_selected_for_install(selected_items))
         
         info_action = menu.addAction("Show Info")
-        info_action.triggered.connect(lambda: self._show_package_info(pkg))
+        info_action.triggered.connect(lambda: self._show_package_info(first_pkg))
         
-        if pkg.action != InstallAction.NONE:
+        # Check if any selected package has a mark to clear
+        has_marked = any(p.action != InstallAction.NONE for p in self._get_packages_from_items(selected_items))
+        if has_marked:
             clear_action = menu.addAction("Clear Mark")
-            clear_action.triggered.connect(lambda: self._clear_mark(pkg))
+            clear_action.triggered.connect(lambda: self._clear_marks_for_items(selected_items))
         
         menu.exec(self.package_list.viewport().mapToGlobal(pos))
     
@@ -669,6 +679,36 @@ class OMInstaller(QMainWindow):
     def _clear_mark(self, pkg: Package):
         pkg.action = InstallAction.NONE
         self._update_package_item(pkg)
+    
+    def _get_packages_from_items(self, items: list) -> list[Package]:
+        """Extract Package objects from QTreeWidgetItem objects."""
+        packages = []
+        for item in items:
+            pkg = item.data(0, Qt.ItemDataRole.UserRole)
+            if pkg:
+                packages.append(pkg)
+        return packages
+    
+    def _mark_selected_for_install(self, items: list):
+        """Mark all selected packages for installation."""
+        packages = self._get_packages_from_items(items)
+        for pkg in packages:
+            pkg.action = InstallAction.INSTALL
+            self._update_package_item(pkg)
+    
+    def _mark_selected_for_remove(self, items: list):
+        """Mark all selected packages for removal."""
+        packages = self._get_packages_from_items(items)
+        for pkg in packages:
+            pkg.action = InstallAction.REMOVE
+            self._update_package_item(pkg)
+    
+    def _clear_marks_for_items(self, items: list):
+        """Clear marks from all selected items."""
+        packages = self._get_packages_from_items(items)
+        for pkg in packages:
+            pkg.action = InstallAction.NONE
+            self._update_package_item(pkg)
     
     def _update_package_item(self, pkg: Package):
         for i in range(self.package_list.topLevelItemCount()):
