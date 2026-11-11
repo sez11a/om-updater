@@ -26,7 +26,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QLabel, QListWidget,
     QPushButton, QPlainTextEdit, QProgressBar
 )
-from PyQt6.QtCore import QTimer, QProcess, Qt
+from PyQt6.QtCore import QTimer, QProcess, Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QIcon, QPixmap, QPainter, QColor, QPen, QFont, QAction
 
 
@@ -202,6 +202,28 @@ flatpak update --system --assumeyes --noninteractive
 
         return exit_code
 
+class UpdateCheckWorker(QThread):
+    """Runs the blocking DNF/Freeipa update checks off the GUI thread."""
+
+    check_done = pyqtSignal(list, list, int)
+    check_failed_sig = pyqtSignal(list, list, int, str)
+
+    def __init__(self, host: "OMUpdater", request_id: int = 0):
+        super().__init__(None)
+        self.host = host
+        self.request_id = request_id
+
+    def run(self):
+        rpm_updates: list[str] = []
+        flatpak_updates: list[str] = []
+        try:
+            rpm_updates = self.host._check_rpm_updates()
+            flatpak_updates = self.host._check_flatpak_updates()
+            self.check_done.emit(rpm_updates, flatpak_updates, self.request_id)
+        except Exception as e:
+            self.check_failed_sig.emit(rpm_updates, flatpak_updates, self.request_id, str(e))
+
+
 class OMUpdater(QApplication):
     def __init__(self):
         super().__init__(sys.argv)
@@ -211,6 +233,8 @@ class OMUpdater(QApplication):
         self.flatpak_updates = []   # combined with [User] / [System] prefix
         self.updates_available = False
         self.update_in_progress = False
+        self.check_request = 0
+        self.check_worker = None
 
         self.green_icon = self._create_circle_icon(QColor(0, 180, 0), None)
         self.red_icon = self._create_circle_icon(QColor(220, 20, 20), "!")
@@ -226,7 +250,7 @@ class OMUpdater(QApplication):
         self.timer.timeout.connect(self.check_for_updates)
         self.timer.start(60 * 60 * 1000)
 
-        self.check_for_updates()
+        self._start_update_check()
 
 
     def _create_circle_icon(self, bg_color: QColor, text: str | None):
@@ -261,11 +285,38 @@ class OMUpdater(QApplication):
     def check_for_updates(self):
         if self.update_in_progress:
             return
-        
-        self.rpm_updates = self._check_rpm_updates()
-        self.flatpak_updates = self._check_flatpak_updates()
 
-        self.updates_available = bool(self.rpm_updates) or bool(self.flatpak_updates)
+        self._start_update_check()
+
+    def _start_update_check(self):
+        """Start the update check in a background thread.
+
+        The check itself runs blocking subprocess calls (dnf/flatpak), so it
+        must never run on the Qt GUI thread (see .agents/gui-threading/SKILL.md).
+        The QTimer/context-menu slot only launches the worker; results are
+        applied via the worker's signals on the GUI thread.
+        """
+        if self.check_worker is not None and self.check_worker.isRunning():
+            # A check is already in flight; skip this tick.
+            return
+
+        self.check_request += 1
+        request_id = self.check_request
+
+        worker = UpdateCheckWorker(self, request_id)
+        worker.check_done.connect(self._on_check_done)
+        worker.check_failed_sig.connect(self._on_check_failed)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+        self.check_worker = worker
+
+    def _on_check_done(self, rpm_updates: list[str], flatpak_updates: list[str], request_id: int):
+        if request_id != self.check_request:
+            # A newer check has superseded this result; drop it.
+            return
+        self.rpm_updates = rpm_updates
+        self.flatpak_updates = flatpak_updates
+        self.updates_available = bool(rpm_updates) or bool(flatpak_updates)
 
         if self.updates_available:
             self.tray.setIcon(self.red_icon)
@@ -274,6 +325,13 @@ class OMUpdater(QApplication):
         else:
             self.tray.setIcon(self.green_icon)
             self.tray.setToolTip("System up to date.")
+
+    def _on_check_failed(self, rpm_updates: list[str], flatpak_updates: list[str], request_id: int, error: str):
+        if request_id != self.check_request:
+            # A newer check has superseded this result; drop it.
+            return
+        print(f"Update check failed: {error}", flush=True)
+        # Keep the last known tray state when a check fails.
 
     def _refresh_package_lists(self):
         """Refresh package and flatpak metadata before checking for updates."""
@@ -593,21 +651,9 @@ class OMUpdater(QApplication):
     
     def _post_update_check(self):
         """Check for updates after a delay, allowing metadata to refresh."""
-        # Check for updates directly (don't refresh metadata - flatpak handles this)
-        self.rpm_updates = self._check_rpm_updates()
-        self.flatpak_updates = self._check_flatpak_updates()
-        
-        self.updates_available = bool(self.rpm_updates) or bool(self.flatpak_updates)
-        
-        self.output_text.appendPlainText(f"\nUpdate check: RPM updates: {len(self.rpm_updates)}, Flatpak updates: {len(self.flatpak_updates)}")
-
-        if self.updates_available:
-            self.tray.setIcon(self.red_icon)
-            count = len(self.rpm_updates) + len(self.flatpak_updates)
-            self.tray.setToolTip(f"System needs updating ({count} updates)")
-        else:
-            self.tray.setIcon(self.green_icon)
-            self.tray.setToolTip("System up to date.")
+        # Check for updates directly (don't refresh metadata - flatpak handles this).
+        # The blocking check runs in a background worker; results arrive via signal.
+        self.check_for_updates()
 
 
 if __name__ == "__main__":
